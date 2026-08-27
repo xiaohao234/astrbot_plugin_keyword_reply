@@ -1,0 +1,47 @@
+{
+  "enabled": {
+    "description": "是否启用关键词自动回复",
+    "type": "bool",
+    "default": true
+  },
+  "case_sensitive": {
+    "description": "关键词匹配是否区分大小写",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭后英文关键词不区分大小写；中文关键词不受影响。"
+  },
+  "send_interval": {
+    "description": "多条回复之间的发送间隔（秒）",
+    "type": "float",
+    "default": 0.5,
+    "hint": "命中关键词后需要连续发送多条回复时，两条消息之间的等待时间，用于防止平台风控。设为 0 表示不等待；范围 0-60，超出会被自动收敛。"
+  },
+  "rules": {
+    "description": "关键词回复规则列表",
+    "type": "template_list",
+    "templates": {
+      "keyword_reply": {
+        "name": "关键词回复规则",
+        "hint": "命中任意关键词时，依次发送下方配置的所有回复。",
+        "display_item": "remark",
+        "items": {
+          "remark": {
+            "description": "规则备注（仅用于列表区分，不影响匹配）",
+            "type": "string",
+            "default": ""
+          },
+          "keywords": {
+            "description": "关键词（每行一个，命中任意一个即触发；支持在句子中间匹配）",
+            "type": "text",
+            "default": ""
+          },
+          "reply": {
+            "description": "回复内容（支持多行；用单独一行 --- 分隔多条回复，每条作为一条独立消息依次发送）",
+            "type": "text",
+            "default": ""
+          }
+        }
+      }
+    }
+  }
+}

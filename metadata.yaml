@@ -1,0 +1,7 @@
+name: astrbot_plugin_keyword_reply
+display_name: 关键词自动回复
+desc: 检测消息中的关键词（支持句子中间匹配）并自动回复，支持多关键词、多回复、多行回复，可在 WebUI 配置。
+version: v1.1.0
+author: xiaohao234
+repo: https://github.com/xiaohao234/astrbot_plugin_keyword_reply
+astrbot_version: ">=4.10.4"

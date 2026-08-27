@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.py[codz]
+
+# astrbot 本地运行产物
+data/
+
+# IDE
+.idea/
+.vscode/
