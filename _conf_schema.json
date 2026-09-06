@@ -10,6 +10,12 @@
     "default": false,
     "hint": "关闭后英文关键词不区分大小写；中文关键词不受影响。"
   },
+  "whole_word": {
+    "description": "整词匹配（防止英文/数字关键词被粘连误触发）",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，含英文/数字的关键词必须独立出现才触发：例如关键词 mj 不再命中 mmj、mja2、mj_1；前后是中文或标点时仍正常触发（如 这是mj、mj吧）。中文关键词不受影响，仍支持句子中间匹配。"
+  },
   "send_interval": {
     "description": "多条回复之间的发送间隔（秒）",
     "type": "float",

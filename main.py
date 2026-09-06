@@ -3,6 +3,8 @@
 
 在 WebUI 中配置「关键词 -> 回复内容」规则：
 - 关键词每行一个，命中任意一个即触发，支持在句子中间匹配；
+- 可开启「整词匹配」：含英文/数字的关键词必须独立出现才触发
+  （如关键词 mj 不再命中 mmj、mja2），中文关键词不受影响；
 - 回复内容支持多行，用单独一行 ``---`` 分隔多条回复，每条回复会作为一条独立消息依次发送；
 - 回复内容中可用行首 ``[图片]``（或 ``[img]``）标记发送图片，后面跟图片来源，
   标记行与普通文字行可任意混排，从而自由控制图片在回复序列中的位置
@@ -54,6 +56,7 @@ MAX_SEND_INTERVAL = 60.0
 _runtime: dict[str, Any] = {
     "enabled": True,
     "case_sensitive": False,
+    "whole_word": False,
     "send_interval": 0.5,
     # 编译后的规则：[{"keywords": [str, ...],
     #                "replies": [[{"type": "text", "text": str} | {"type": "image", "src": str}, ...], ...]}, ...]
@@ -289,12 +292,48 @@ def _compile_rules(raw_rules: Any) -> list[dict[str, Any]]:
     return compiled
 
 
+def _is_ascii_word_char(ch: str) -> bool:
+    """判断字符是否为「英文粘连字符」：ASCII 字母 / 数字 / 下划线。
+
+    整词匹配只把这类字符视为粘连，中文等全角字符不算，
+    因此「这是mj」「mj吧」这类中英混排场景不受整词模式影响。
+    """
+    return ch.isascii() and (ch.isalnum() or ch == "_")
+
+
+def _keyword_hit(haystack: str, needle: str, whole_word: bool) -> bool:
+    """判断单个关键词是否命中（调用方已处理大小写归一）。
+
+    - 整词模式关闭：子串匹配（原行为）；
+    - 整词模式开启：关键词必须独立出现——命中位置的前一个字符和
+      后一个字符都不能是 ASCII 字母 / 数字 / 下划线（如关键词 mj
+      不再命中 mmj、mja2），全部位置都粘连时视为未命中。
+    """
+    if not whole_word:
+        return needle in haystack
+
+    start = haystack.find(needle)
+    while start != -1:
+        before_ok = start == 0 or not _is_ascii_word_char(haystack[start - 1])
+        end = start + len(needle)
+        after_ok = end >= len(haystack) or not _is_ascii_word_char(haystack[end])
+        if before_ok and after_ok:
+            return True
+        start = haystack.find(needle, start + 1)
+    return False
+
+
 def _match_rules(
     text: str,
     compiled: list[dict[str, Any]],
     case_sensitive: bool,
+    whole_word: bool = False,
 ) -> list[dict[str, Any]]:
-    """返回命中的规则列表（保持配置顺序）。子串匹配。"""
+    """返回命中的规则列表（保持配置顺序）。
+
+    整词模式开启时，英文/数字关键词必须独立出现才命中，
+    中文关键词不受影响（仍支持句子中间匹配）。
+    """
     if not text:
         return []
     haystack = text if case_sensitive else text.lower()
@@ -303,7 +342,7 @@ def _match_rules(
         hit = False
         for kw in rule["keywords"]:
             needle = kw if case_sensitive else kw.lower()
-            if needle in haystack:
+            if _keyword_hit(haystack, needle, whole_word):
                 hit = True
                 break
         if hit:
@@ -351,6 +390,7 @@ class KeywordReplyFilter(CustomFilter):
                     text,
                     _runtime["compiled_rules"],
                     _runtime["case_sensitive"],
+                    _runtime["whole_word"],
                 )
             )
         except Exception as exc:  # noqa: BLE001
@@ -371,6 +411,7 @@ class KeywordReplyPlugin(Star):
         cfg = self.config
         _runtime["enabled"] = bool(cfg.get("enabled", True))
         _runtime["case_sensitive"] = bool(cfg.get("case_sensitive", False))
+        _runtime["whole_word"] = bool(cfg.get("whole_word", False))
         _runtime["send_interval"] = _coerce_interval(cfg.get("send_interval", 0.5))
         _runtime["compiled_rules"] = _compile_rules(cfg.get("rules"))
 
@@ -379,6 +420,7 @@ class KeywordReplyPlugin(Star):
         logger.info(
             f"[keyword_reply] 已加载 {len(_runtime['compiled_rules'])} 条规则"
             f"（启用={_runtime['enabled']}，区分大小写={_runtime['case_sensitive']}，"
+            f"整词匹配={_runtime['whole_word']}，"
             f"发送间隔={_runtime['send_interval']}s）"
         )
 
@@ -398,6 +440,7 @@ class KeywordReplyPlugin(Star):
             text,
             _runtime["compiled_rules"],
             _runtime["case_sensitive"],
+            _runtime["whole_word"],
         )
         if not matched:
             return
