@@ -4,10 +4,13 @@
 在 WebUI 中配置「关键词 -> 回复内容」规则：
 - 关键词每行一个，命中任意一个即触发，支持在句子中间匹配；
 - 回复内容支持多行，用单独一行 ``---`` 分隔多条回复，每条回复会作为一条独立消息依次发送；
-- 回复内容中可用行首 ``[图片]``（或 ``[img]``）标记发送图片，后面跟图片 URL 或本地路径；
+- 回复内容中可用行首 ``[图片]``（或 ``[img]``）标记发送图片，后面跟图片来源，
   标记行与普通文字行可任意混排，从而自由控制图片在回复序列中的位置
   （例如：先发一条文本消息，再发一张图片，最后再发一条文本消息）；
   同一块内的文字与图片会组装进同一条 MessageChain 一起发出；
+- 图片来源支持三种写法：网络 URL（http/https）、本地路径，以及引用规则「图片池」：
+  在 WebUI 上传图片到规则的 images 字段后，用 ``[图片:编号]``（如 ``[图片:1]``）
+  或 ``[图片:文件名]``（如 ``[图片:欢迎.gif]``）引用，上传的 GIF 动图等格式原样透传；
 - 多条回复之间可配置发送间隔（默认 0.5 秒），防止平台风控。
 
 实现说明：
@@ -21,19 +24,25 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import re
 from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import MessageChain, filter, AstrMessageEvent
 from astrbot.api.event.filter import CustomFilter
 from astrbot.api.message_components import Image, Plain
-from astrbot.api.star import Context, Star
+from astrbot.api.star import Context, Star, StarTools
+
+# 插件名（与 metadata.yaml 的 name 一致），用于定位插件数据目录
+PLUGIN_NAME = "astrbot_plugin_keyword_reply"
 
 # 多条回复之间的分隔符（需要单独占一行）
 REPLY_SEPARATOR = "---"
 
-# 图片标记：出现在某行行首（忽略首尾空白与大小写）时，该行表示一张图片，
-# 标记后的剩余内容为图片 URL（http/https）或本地文件路径
+# 图片标记：出现在某行行首（忽略首尾空白与大小写）时，该行表示一张图片。
+# 两种写法：``[图片]来源``（来源跟在标记后）或 ``[图片:来源]``（来源写在括号内）。
+# 来源可以是 URL、本地路径，或规则图片池的编号/文件名引用。
 IMAGE_MARKERS = ("[图片]", "[img]")
 
 # 发送间隔的上限（秒），防止配置成异常大的值
@@ -64,30 +73,118 @@ def _parse_keywords(raw: str) -> list[str]:
     return keywords
 
 
-def _extract_image_source(line: str) -> str | None:
-    """判断一行是否为图片标记行：是则返回图片来源，否则返回 None。
+def _plugin_data_dir() -> str:
+    """返回插件数据目录（data/plugin_data/<插件名>）。
 
-    图片标记为行首（忽略首尾空白与大小写）的 ``[图片]`` 或 ``[img]``，
-    标记后的剩余内容为图片 URL（http/https）或本地文件路径；
+    优先通过 StarTools 获取；不可用时回退为相对进程工作目录的路径。
+    """
+    try:
+        return str(StarTools.get_data_dir(PLUGIN_NAME))
+    except Exception:  # noqa: BLE001
+        return os.path.join("data", "plugin_data", PLUGIN_NAME)
+
+
+def _resolve_local_path(src: str) -> str:
+    """把本地路径解析为可发送的绝对路径。
+
+    相对路径优先按「插件数据目录」解析（WebUI 上传的文件存在那里），
+    文件确实存在时才采用；否则回退为按进程工作目录解析的绝对路径。
+    """
+    if os.path.isabs(src):
+        return src
+    candidate = os.path.join(_plugin_data_dir(), src)
+    if os.path.isfile(candidate):
+        return candidate
+    return os.path.abspath(src)
+
+
+def _resolve_image_source(src: str, image_pool: list[str]) -> str | None:
+    """把标记后的图片来源解析为可直接发送的 URL / 绝对路径。
+
+    解析优先级：
+    - ``http://`` / ``https://`` 开头 → 网络图片 URL；
+    - 纯数字 → 引用规则图片池中第 N 张（从 1 开始）；
+    - 不含路径分隔符 → 在规则图片池中按文件名（basename）匹配；
+    - 其余 → 本地路径（相对路径按插件数据目录解析）。
+    无法解析时记录日志并返回 None（该图片会被跳过）。
+    """
+    lowered = src.lower()
+    if lowered.startswith(("http://", "https://")):
+        return src
+    if lowered.startswith("file://"):
+        return _resolve_local_path(src[len("file://"):])
+    if src.isdigit():
+        index = int(src)
+        if 1 <= index <= len(image_pool):
+            return image_pool[index - 1]
+        logger.warning(
+            f"[keyword_reply] [图片:{src}] 超出规则图片池范围（共 {len(image_pool)} 张），已跳过"
+        )
+        return None
+    if "/" not in src and "\\" not in src:
+        name = src.lower()
+        for path in image_pool:
+            if os.path.basename(path).lower() == name:
+                return path
+        logger.warning(f"[keyword_reply] 未在规则图片池中找到图片「{src}」，已跳过")
+        return None
+    return _resolve_local_path(src)
+
+
+def _compile_image_pool(raw_images: Any) -> list[str]:
+    """把规则的 images 字段（WebUI 上传生成的路径列表）编译为可发送的图片池。
+
+    本地路径在编译期解析为绝对路径（相对路径按插件数据目录解析），
+    文件不存在的条目记日志后忽略，保证「[图片:编号]」引用始终指向有效文件；
+    URL 条目原样保留。
+    """
+    if not isinstance(raw_images, list):
+        return []
+    pool: list[str] = []
+    for item in raw_images:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        src = item.strip()
+        if src.lower().startswith(("http://", "https://")):
+            pool.append(src)
+            continue
+        path = _resolve_local_path(src)
+        if os.path.isfile(path):
+            pool.append(path)
+        else:
+            logger.warning(f"[keyword_reply] 规则图片池中的文件不存在，已忽略: {src}")
+    return pool
+
+
+def _extract_image_source(line: str) -> str | None:
+    """判断一行是否为图片标记行：是则返回标记后的原始来源，否则返回 None。
+
+    支持两种标记写法（均忽略首尾空白与大小写）：
+    - ``[图片]来源`` / ``[img]来源``：标记后整行剩余内容为来源；
+    - ``[图片:来源]`` / ``[img:来源]``：来源写在方括号内（适合引用图片池）。
     返回空字符串表示该行是图片标记但未填写来源。
     """
     stripped = line.strip()
+    colon_form = re.match(r"^\[(?:图片|img):([^\]]*)\]$", stripped, re.IGNORECASE)
+    if colon_form:
+        return colon_form.group(1).strip()
     lowered = stripped.lower()
     for marker in IMAGE_MARKERS:
         if lowered.startswith(marker):
-            src = stripped[len(marker):].strip()
-            if src.lower().startswith("file://"):
-                src = src[len("file://"):]
-            return src
+            return stripped[len(marker):].strip()
     return None
 
 
-def _parse_block_components(block_lines: list[str]) -> list[dict[str, str]]:
+def _parse_block_components(
+    block_lines: list[str],
+    image_pool: list[str],
+) -> list[dict[str, str]]:
     """把单个回复块解析为按原文顺序排列的组件列表（图文混排）。
 
     普通文字行合并为一个文本组件（保留内部换行）；
-    图片标记行解析为一个图片组件（type=image）。
-    未填写来源的图片标记行记日志后跳过；全部为空时返回空列表。
+    图片标记行解析为一个图片组件（type=image），来源中的图片池引用
+    会在编译期解析为绝对路径。无法解析的图片记日志后跳过；
+    全部为空时返回空列表。
     """
     components: list[dict[str, str]] = []
     text_lines: list[str] = []
@@ -107,15 +204,20 @@ def _parse_block_components(block_lines: list[str]) -> list[dict[str, str]]:
             continue
         # 遇到图片标记：先收尾前面累计的文字，再记录图片
         flush_text()
-        if src:
-            components.append({"type": "image", "src": src})
-        else:
+        if not src:
             logger.warning("[keyword_reply] 回复内容中有图片标记但未填写来源，已跳过该图片")
+            continue
+        resolved = _resolve_image_source(src, image_pool)
+        if resolved:
+            components.append({"type": "image", "src": resolved})
     flush_text()
     return components
 
 
-def _parse_replies(raw: str) -> list[list[dict[str, str]]]:
+def _parse_replies(
+    raw: str,
+    image_pool: list[str] | None = None,
+) -> list[list[dict[str, str]]]:
     """把回复内容解析为多条消息，每条消息是一组有序组件。
 
     规则：
@@ -128,6 +230,7 @@ def _parse_replies(raw: str) -> list[list[dict[str, str]]]:
     """
     if raw is None:
         return []
+    pool = image_pool or []
 
     blocks: list[list[str]] = [[]]
     for line in str(raw).splitlines():
@@ -143,7 +246,7 @@ def _parse_replies(raw: str) -> list[list[dict[str, str]]]:
             block.pop(0)
         while block and not block[-1].strip():
             block.pop()
-        components = _parse_block_components(block)
+        components = _parse_block_components(block, pool)
         if components:
             replies.append(components)
     return replies
@@ -174,7 +277,8 @@ def _compile_rules(raw_rules: Any) -> list[dict[str, Any]]:
         if not isinstance(rule, dict):
             continue
         keywords = _parse_keywords(rule.get("keywords", ""))
-        replies = _parse_replies(rule.get("reply", ""))
+        image_pool = _compile_image_pool(rule.get("images"))
+        replies = _parse_replies(rule.get("reply", ""), image_pool)
         if not keywords or not replies:
             continue
         compiled.append({"keywords": keywords, "replies": replies})
