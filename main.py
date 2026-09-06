@@ -258,6 +258,10 @@ def _coerce_interval(value: Any) -> float:
         v = float(value)
     except (TypeError, ValueError):
         return 0.0
+    if v != v:
+        # NaN：与任何值比较均为 False，会绕过下方上下限收敛；
+        # 一旦进入 asyncio.sleep 会让回复序列在空闲时停住，直接取默认值
+        return 0.0
     if v < 0:
         return 0.0
     if v > MAX_SEND_INTERVAL:
