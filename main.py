@@ -382,6 +382,15 @@ class KeywordReplyFilter(CustomFilter):
         try:
             if not _runtime["enabled"]:
                 return False
+            # 忽略机器人自身的消息（NapCat 开启 report_self_message 后会回流进管线）：
+            # 机器人回复中若恰好包含关键词，会再次触发回复，甚至形成自问自答循环。
+            # 正常情况下 replyguard 会硬拦自身消息回环，这里不再依赖其他插件兜底。
+            try:
+                self_id = str(event.get_self_id() or "")
+                if self_id and str(event.get_sender_id() or "") == self_id:
+                    return False
+            except Exception:  # noqa: BLE001 旧版本事件对象缺方法时宁可放行也不崩溃
+                pass
             text = (event.get_message_str() or "").strip()
             if not text:
                 return False
