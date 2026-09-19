@@ -13,6 +13,8 @@
 - 图片来源支持三种写法：网络 URL（http/https）、本地路径，以及引用规则「图片池」：
   在 WebUI 上传图片到规则的 images 字段后，用 ``[图片:编号]``（如 ``[图片:1]``）
   或 ``[图片:文件名]``（如 ``[图片:欢迎.gif]``）引用，上传的 GIF 动图等格式原样透传；
+- 可开启「回复时引用原消息」（默认关闭）：开启后触发回复的**第一条**消息
+  会以引用原消息的方式发出，后续消息仍为普通消息；
 - 多条回复之间可配置发送间隔（默认 0.5 秒），防止平台风控。
 
 实现说明：
@@ -33,7 +35,7 @@ from typing import Any
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import MessageChain, filter, AstrMessageEvent
 from astrbot.api.event.filter import CustomFilter
-from astrbot.api.message_components import Image, Plain
+from astrbot.api.message_components import Image, Plain, Reply
 from astrbot.api.star import Context, Star, StarTools
 
 # 插件名（与 metadata.yaml 的 name 一致），用于定位插件数据目录
@@ -57,6 +59,7 @@ _runtime: dict[str, Any] = {
     "enabled": True,
     "case_sensitive": False,
     "whole_word": False,
+    "quote_reply": False,
     "send_interval": 0.5,
     # 编译后的规则：[{"keywords": [str, ...],
     #                "replies": [[{"type": "text", "text": str} | {"type": "image", "src": str}, ...], ...]}, ...]
@@ -350,13 +353,32 @@ def _match_rules(
     return matched
 
 
-def _build_message_chain(components: list[dict[str, str]]) -> MessageChain | None:
+def _get_quote_message_id(event: AstrMessageEvent) -> str | None:
+    """取原消息 ID 用于引用回复；取不到时返回 None（自动降级为普通发送）。
+
+    各平台事件对象的字段存在差异（如 aiocqhttp 的 message_obj.message_id），
+    统一在此兜底，绝不因取引用失败而中断回复。
+    """
+    try:
+        mid = getattr(getattr(event, "message_obj", None), "message_id", None)
+        return str(mid) if mid else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _build_message_chain(
+    components: list[dict[str, str]],
+    quote_id: str | None = None,
+) -> MessageChain | None:
     """把编译后的组件列表构建为可发送的 MessageChain。
 
-    每次发送都重新构建组件实例（不复用上次的组件对象），避免适配器
-    对同一组件实例产生状态残留；构建结果为空时返回 None。
+    quote_id 非空时在链首插入 Reply 组件（引用原消息），仅用于本次触发的
+    第一条回复；每次发送都重新构建组件实例（不复用上次的组件对象），
+    避免适配器对同一组件实例产生状态残留；构建结果为空时返回 None。
     """
     parts: list[Any] = []
+    if quote_id:
+        parts.append(Reply(id=quote_id))
     for comp in components:
         if comp["type"] == "text":
             parts.append(Plain(comp["text"]))
@@ -421,6 +443,7 @@ class KeywordReplyPlugin(Star):
         _runtime["enabled"] = bool(cfg.get("enabled", True))
         _runtime["case_sensitive"] = bool(cfg.get("case_sensitive", False))
         _runtime["whole_word"] = bool(cfg.get("whole_word", False))
+        _runtime["quote_reply"] = bool(cfg.get("quote_reply", False))
         _runtime["send_interval"] = _coerce_interval(cfg.get("send_interval", 0.5))
         _runtime["compiled_rules"] = _compile_rules(cfg.get("rules"))
 
@@ -429,7 +452,7 @@ class KeywordReplyPlugin(Star):
         logger.info(
             f"[keyword_reply] 已加载 {len(_runtime['compiled_rules'])} 条规则"
             f"（启用={_runtime['enabled']}，区分大小写={_runtime['case_sensitive']}，"
-            f"整词匹配={_runtime['whole_word']}，"
+            f"整词匹配={_runtime['whole_word']}，引用原消息={_runtime['quote_reply']}，"
             f"发送间隔={_runtime['send_interval']}s）"
         )
 
@@ -456,13 +479,18 @@ class KeywordReplyPlugin(Star):
 
         sent = 0
         interval = _runtime["send_interval"]
+        # 引用原消息只加在本次触发的第一条回复上，避免每条都带引用刷屏
+        quote_id = _get_quote_message_id(event) if _runtime["quote_reply"] else None
         for rule in matched:
             for message in rule["replies"]:
                 # 已发送过至少一条且配置了间隔时，等待后再发下一条，防止平台风控
                 if sent > 0 and interval > 0:
                     await asyncio.sleep(interval)
                 try:
-                    chain = _build_message_chain(message)
+                    chain = _build_message_chain(
+                        message,
+                        quote_id if sent == 0 else None,
+                    )
                     if chain is None:
                         continue
                     await event.send(chain)
