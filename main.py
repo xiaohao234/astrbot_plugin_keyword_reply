@@ -15,6 +15,8 @@
   或 ``[图片:文件名]``（如 ``[图片:欢迎.gif]``）引用，上传的 GIF 动图等格式原样透传；
 - 可开启「回复时引用原消息」（默认关闭）：开启后触发回复的**第一条**消息
   会以引用原消息的方式发出，后续消息仍为普通消息；
+- 可配置「用户触发冷却」：同一用户触发回复后，冷却时间内再次发送含关键词的
+  消息时插件不回复、不介入（默认 0 = 不限制），防止个别人刷屏；
 - 多条回复之间可配置发送间隔（默认 0.5 秒），防止平台风控。
 
 实现说明：
@@ -30,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
@@ -52,6 +55,12 @@ IMAGE_MARKERS = ("[图片]", "[img]")
 # 发送间隔的上限（秒），防止配置成异常大的值
 MAX_SEND_INTERVAL = 60.0
 
+# 用户触发冷却的上限（秒），防止配置成异常大的值
+MAX_COOLDOWN = 3600.0
+
+# 冷却表的整理阈值：超过该条目数时清理已过期的记录，防止长期运行下无限增长
+COOLDOWN_PRUNE_THRESHOLD = 512
+
 # 模块级运行时状态：用于在「自定义过滤器」与「消息处理器」之间共享已解析的配置。
 # 该对象在插件每次加载 / 重载（含 WebUI 保存配置触发的热重载）时被整体重新填充，
 # 其大小只取决于规则数量，不会随消息数量增长，因此不存在内存泄漏。
@@ -61,6 +70,10 @@ _runtime: dict[str, Any] = {
     "whole_word": False,
     "quote_reply": False,
     "send_interval": 0.5,
+    "cooldown_seconds": 0.0,
+    # 用户冷却表："{会话}:{发送者}" -> 最后一次触发的时间戳（time.monotonic）。
+    # 仅保留冷却期内的用户（超过阈值时 opportunistic 清理），不随消息量无限增长。
+    "cooldowns": {},
     # 编译后的规则：[{"keywords": [str, ...],
     #                "replies": [[{"type": "text", "text": str} | {"type": "image", "src": str}, ...], ...]}, ...]
     "compiled_rules": [],
@@ -275,6 +288,61 @@ def _coerce_interval(value: Any) -> float:
     return v
 
 
+def _coerce_cooldown(value: Any) -> float:
+    """把配置值安全转换为 [0, 3600] 区间内的用户冷却时间（秒）。"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if v != v:  # NaN 防御，同 _coerce_interval
+        return 0.0
+    if v < 0:
+        return 0.0
+    if v > MAX_COOLDOWN:
+        return MAX_COOLDOWN
+    return v
+
+
+def _cooldown_key(event: AstrMessageEvent) -> str | None:
+    """构造用户冷却表的键："{会话}:{发送者}"。
+
+    取不到发送者时返回 None（视为无法限流，放行）；
+    会话标识取不到时退化为仅按发送者限流。
+    """
+    try:
+        sender = str(event.get_sender_id() or "")
+    except Exception:  # noqa: BLE001
+        return None
+    if not sender:
+        return None
+    try:
+        origin = str(event.unified_msg_origin or "")
+    except Exception:  # noqa: BLE001
+        origin = ""
+    return f"{origin}:{sender}"
+
+
+def _cooldown_active(event: AstrMessageEvent) -> bool:
+    """判断该用户是否处于触发冷却期内。"""
+    cooldown = _runtime["cooldown_seconds"]
+    if cooldown <= 0:
+        return False
+    key = _cooldown_key(event)
+    if not key:
+        return False
+    last = _runtime["cooldowns"].get(key)
+    return last is not None and (time.monotonic() - last) < cooldown
+
+
+def _prune_cooldowns(now: float, cooldown: float) -> None:
+    """冷却表只保留冷却期内的用户，超过阈值时清理过期记录。"""
+    if cooldown <= 0 or len(_runtime["cooldowns"]) < COOLDOWN_PRUNE_THRESHOLD:
+        return
+    _runtime["cooldowns"] = {
+        k: ts for k, ts in _runtime["cooldowns"].items() if now - ts < cooldown
+    }
+
+
 def _compile_rules(raw_rules: Any) -> list[dict[str, Any]]:
     """把配置中的规则列表编译为便于匹配的结构。
 
@@ -413,6 +481,10 @@ class KeywordReplyFilter(CustomFilter):
                     return False
             except Exception:  # noqa: BLE001 旧版本事件对象缺方法时宁可放行也不崩溃
                 pass
+            if _cooldown_active(event):
+                # 用户处于触发冷却期：插件不回复、不介入，
+                # 消息继续走机器人正常流程（是否由 LLM 处理由其唤醒规则决定）
+                return False
             text = (event.get_message_str() or "").strip()
             if not text:
                 return False
@@ -445,6 +517,7 @@ class KeywordReplyPlugin(Star):
         _runtime["whole_word"] = bool(cfg.get("whole_word", False))
         _runtime["quote_reply"] = bool(cfg.get("quote_reply", False))
         _runtime["send_interval"] = _coerce_interval(cfg.get("send_interval", 0.5))
+        _runtime["cooldown_seconds"] = _coerce_cooldown(cfg.get("cooldown_seconds", 0))
         _runtime["compiled_rules"] = _compile_rules(cfg.get("rules"))
 
     async def initialize(self):
@@ -453,7 +526,7 @@ class KeywordReplyPlugin(Star):
             f"[keyword_reply] 已加载 {len(_runtime['compiled_rules'])} 条规则"
             f"（启用={_runtime['enabled']}，区分大小写={_runtime['case_sensitive']}，"
             f"整词匹配={_runtime['whole_word']}，引用原消息={_runtime['quote_reply']}，"
-            f"发送间隔={_runtime['send_interval']}s）"
+            f"发送间隔={_runtime['send_interval']}s，用户冷却={_runtime['cooldown_seconds']}s）"
         )
 
     async def terminate(self):
@@ -476,6 +549,15 @@ class KeywordReplyPlugin(Star):
         )
         if not matched:
             return
+
+        # 用户触发冷却：命中后在发送前立即登记时间戳（而非发送成功后），
+        # 避免并发消息在两次发送之间重复通过；冷却期内再次触发会被过滤器直接拦下
+        if _cooldown_active(event):
+            return
+        cd_key = _cooldown_key(event)
+        if cd_key and _runtime["cooldown_seconds"] > 0:
+            _runtime["cooldowns"][cd_key] = time.monotonic()
+            _prune_cooldowns(time.monotonic(), _runtime["cooldown_seconds"])
 
         sent = 0
         interval = _runtime["send_interval"]
