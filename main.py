@@ -6,6 +6,9 @@
 - 可开启「整词匹配」：含英文/数字的关键词必须独立出现才触发
   （如关键词 mj 不再命中 mmj、mja2），中文关键词不受影响；
 - 回复内容支持多行，用单独一行 ``---`` 分隔多条回复，每条回复会作为一条独立消息依次发送；
+- 「回复模式」可选 ``随机一条``（默认 ``顺序发送``）：随机模式下用单独一行 ``===``
+  分隔出多个回复变体，触发时随机选其中**一个**变体发送；
+  每个变体内部仍沿用 ``---`` 多条消息与 ``[图片]`` 图文混排的全部语法；
 - 回复内容中可用行首 ``[图片]``（或 ``[img]``）标记发送图片，后面跟图片来源，
   标记行与普通文字行可任意混排，从而自由控制图片在回复序列中的位置
   （例如：先发一条文本消息，再发一张图片，最后再发一条文本消息）；
@@ -31,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import re
 import time
 from typing import Any
@@ -46,6 +50,16 @@ PLUGIN_NAME = "astrbot_plugin_keyword_reply"
 
 # 多条回复之间的分隔符（需要单独占一行）
 REPLY_SEPARATOR = "---"
+
+# 随机模式下多个回复变体之间的分隔符（需要单独占一行）
+REPLY_VARIANT_SEPARATOR = "==="
+
+# 回复模式的内部取值（编译后的规则里存储）
+REPLY_MODE_SEQUENTIAL = "sequential"
+REPLY_MODE_RANDOM = "random"
+
+# 「回复模式」配置里会被识别为随机模式的取值（其余一律按顺序发送处理）
+REPLY_MODE_RANDOM_LABELS = ("随机一条", "random", "随机")
 
 # 图片标记：出现在某行行首（忽略首尾空白与大小写）时，该行表示一张图片。
 # 两种写法：``[图片]来源``（来源跟在标记后）或 ``[图片:来源]``（来源写在括号内）。
@@ -74,8 +88,11 @@ _runtime: dict[str, Any] = {
     # 用户冷却表："{会话}:{发送者}" -> 最后一次触发的时间戳（time.monotonic）。
     # 仅保留冷却期内的用户（超过阈值时 opportunistic 清理），不随消息量无限增长。
     "cooldowns": {},
-    # 编译后的规则：[{"keywords": [str, ...],
-    #                "replies": [[{"type": "text", "text": str} | {"type": "image", "src": str}, ...], ...]}, ...]
+    # 编译后的规则：
+    # 顺序模式：[{"keywords": [str, ...], "mode": "sequential",
+    #            "replies": [[{"type": "text", "text": str} | {"type": "image", "src": str}, ...], ...]}, ...]
+    # 随机模式：[{"keywords": [str, ...], "mode": "random",
+    #            "variants": [[[组件, ...], ...], ...]}, ...]  （变体 -> 消息 -> 组件）
     "compiled_rules": [],
 }
 
@@ -271,6 +288,46 @@ def _parse_replies(
     return replies
 
 
+def _coerce_reply_mode(value: Any) -> str:
+    """把配置中的「回复模式」归一化为内部取值，未知值一律按顺序发送处理。"""
+    try:
+        text = str(value).strip().lower()
+    except Exception:  # noqa: BLE001
+        return REPLY_MODE_SEQUENTIAL
+    if text in {label.lower() for label in REPLY_MODE_RANDOM_LABELS}:
+        return REPLY_MODE_RANDOM
+    return REPLY_MODE_SEQUENTIAL
+
+
+def _parse_variants(
+    raw: str,
+    image_pool: list[str] | None = None,
+) -> list[list[list[dict[str, str]]]]:
+    """把回复内容解析为多个「变体」，每个变体是一组有序消息。
+
+    用单独一行 ``===`` 分隔变体，触发时随机选其中一个变体发送；
+    每个变体内部沿用 ``---`` 分隔多条消息与 ``[图片]`` 图文混排的全部语法。
+    空变体（无有效内容）自动丢弃；全部为空时返回空列表。
+    """
+    if raw is None:
+        return []
+    pool = image_pool or []
+
+    blocks: list[list[str]] = [[]]
+    for line in str(raw).splitlines():
+        if line.strip() == REPLY_VARIANT_SEPARATOR:
+            blocks.append([])
+        else:
+            blocks[-1].append(line)
+
+    variants: list[list[list[dict[str, str]]]] = []
+    for block in blocks:
+        messages = _parse_replies("\n".join(block), pool)
+        if messages:
+            variants.append(messages)
+    return variants
+
+
 def _coerce_interval(value: Any) -> float:
     """把配置值安全转换为 [0, 60] 区间内的发送间隔（秒）。"""
     try:
@@ -346,6 +403,8 @@ def _prune_cooldowns(now: float, cooldown: float) -> None:
 def _compile_rules(raw_rules: Any) -> list[dict[str, Any]]:
     """把配置中的规则列表编译为便于匹配的结构。
 
+    按「回复模式」编译：顺序模式产生 replies（依次全发），
+    随机模式产生 variants（触发时随机选一个变体）。
     跳过关键词或回复内容为空的规则（此类规则不会产生任何实际效果）。
     """
     if not isinstance(raw_rules, list):
@@ -356,10 +415,17 @@ def _compile_rules(raw_rules: Any) -> list[dict[str, Any]]:
             continue
         keywords = _parse_keywords(rule.get("keywords", ""))
         image_pool = _compile_image_pool(rule.get("images"))
-        replies = _parse_replies(rule.get("reply", ""), image_pool)
-        if not keywords or not replies:
-            continue
-        compiled.append({"keywords": keywords, "replies": replies})
+        mode = _coerce_reply_mode(rule.get("reply_mode"))
+        if mode == REPLY_MODE_RANDOM:
+            variants = _parse_variants(rule.get("reply", ""), image_pool)
+            if not keywords or not variants:
+                continue
+            compiled.append({"keywords": keywords, "mode": mode, "variants": variants})
+        else:
+            replies = _parse_replies(rule.get("reply", ""), image_pool)
+            if not keywords or not replies:
+                continue
+            compiled.append({"keywords": keywords, "mode": REPLY_MODE_SEQUENTIAL, "replies": replies})
     return compiled
 
 
@@ -564,7 +630,12 @@ class KeywordReplyPlugin(Star):
         # 引用原消息只加在本次触发的第一条回复上，避免每条都带引用刷屏
         quote_id = _get_quote_message_id(event) if _runtime["quote_reply"] else None
         for rule in matched:
-            for message in rule["replies"]:
+            if rule["mode"] == REPLY_MODE_RANDOM:
+                # 随机模式：从变体池中选一个变体发送（变体内部仍可有多条消息）
+                messages = random.choice(rule["variants"])
+            else:
+                messages = rule["replies"]
+            for message in messages:
                 # 已发送过至少一条且配置了间隔时，等待后再发下一条，防止平台风控
                 if sent > 0 and interval > 0:
                     await asyncio.sleep(interval)
